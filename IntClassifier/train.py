@@ -179,12 +179,12 @@ def build_engine(sample):
     return eng
 
 
-def train_head(X, y, Xv, yv, k, epochs, patience, bs=256, lr=1e-3, eps=1e-8):
+def train_head(X, y, Xv, yv, k, epochs, patience, bs=256, lr=1e-3, eps=1e-8, seed=0):
     """Linear head on X/255 (uint8 embeddings) on the GPU: Adam with a constant lr, no scheduler or weight decay; early stop on val loss
     after `patience` stale epochs. Returns metrics + the best-val-loss weights (W [2048,k], b) as numpy."""
     X, Xv = torch.as_tensor(X, device="cuda"), torch.as_tensor(Xv, device="cuda").float() / 255  # X stays int8, converted per batch
     y, yv = torch.as_tensor(y, device="cuda").long(), torch.as_tensor(yv, device="cuda").long()
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     head = torch.nn.Linear(2048, k).cuda()
     torch.nn.init.zeros_(head.weight); torch.nn.init.zeros_(head.bias)
     opt = torch.optim.Adam(head.parameters(), lr=lr, eps=eps)
@@ -275,6 +275,7 @@ if __name__ == "__main__":
     ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--eps", type=float, default=1e-8, help="Adam eps")
+    ap.add_argument("--seed", type=int, help="val split + batch order; default: random (printed and saved in metrics.json)")
     ap.add_argument("--per-class", type=int, help="default: all")
     ap.add_argument("--test-per-class", type=int)
     a = ap.parse_args()
@@ -303,11 +304,13 @@ if __name__ == "__main__":
         tm["embed_s"] = time.perf_counter() - t0
         tm["embed_ms_per_img"] = tm["embed_s"] / n * 1e3
         del eng
-    perm = np.random.default_rng(0).permutation(len(X))
+    seed = a.seed if a.seed is not None else int(np.random.SeedSequence().entropy % 2**31)
+    print(f"seed {seed}")
+    perm = np.random.default_rng(seed).permutation(len(X))
     nv = len(X) // 10
     v, t = perm[:nv], perm[nv:]
     t0 = time.perf_counter()
-    info, W, b = train_head(X[t], y[t], X[v], y[v], len(classes), a.epochs, a.patience, lr=a.lr, eps=a.eps)
+    info, W, b = train_head(X[t], y[t], X[v], y[v], len(classes), a.epochs, a.patience, lr=a.lr, eps=a.eps, seed=seed)
     tm["head_train_s"], tm["head_ms_per_epoch"] = time.perf_counter() - t0, (time.perf_counter() - t0) / info["epochs_run"] * 1e3
     head = quantize(W, b)
     acc = float(((Xt.astype(np.int64) @ head["W"].astype(np.int64) + head["b"]).argmax(1) == yt).mean())
@@ -325,7 +328,7 @@ if __name__ == "__main__":
     tm["eval_img_per_s"] = len(te) / (time.perf_counter() - t0)
     assert abs(acc_e - acc) < 0.01, f"engine accuracy {acc_e} != numpy int8 head {acc}"
     m = info | dict(test_acc_engine=acc_e, test_acc_int8_head=acc, test_acc_float_head=acc_f, train=len(t), val=nv, test=len(Xt),
-                    classes=len(classes), lr=a.lr, eps=a.eps, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
+                    classes=len(classes), lr=a.lr, eps=a.eps, seed=seed, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
                     host_peak_ram_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)
     (run / "metrics.json").write_text(json.dumps(m, indent=1))
     print(run, json.dumps(m, indent=1))

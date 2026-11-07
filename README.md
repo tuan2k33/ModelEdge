@@ -50,7 +50,7 @@ python train.py path/to/dataset          # one subfolder per class, every 5th im
 python predict.py weight/run-<time>/model.engine image.jpg
 ```
 
-Options: `--epochs N` (default: train until early stop), `--patience P` (default 10), `--lr` (default 1e-3), `--eps` (Adam eps, default 1e-8), `--per-class N`, `--test-per-class N`.
+Options: `--epochs N` (default: train until early stop), `--patience P` (default 10), `--lr` (default 1e-3), `--eps` (Adam eps, default 1e-8), `--seed` (default: random, saved in `metrics.json`), `--per-class N`, `--test-per-class N`.
 
 Each run writes `weight/run-<time>/`: `model.onnx`, `model.engine`, `metrics.json` (accuracy, timings, GPU and RAM use) and `train.log`.
 `predict.py` reads the class names from the `.onnx` next to the `.engine`.
