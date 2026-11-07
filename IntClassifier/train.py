@@ -179,7 +179,7 @@ def build_engine(sample):
     return eng
 
 
-def train_head(X, y, Xv, yv, k, epochs, patience, bs=256, lr=1e-3):
+def train_head(X, y, Xv, yv, k, epochs, patience, bs=256, lr=1e-3, eps=1e-8):
     """Linear head on X/255 (uint8 embeddings) on the GPU: Adam with a constant lr, no scheduler or weight decay; early stop on val loss
     after `patience` stale epochs. Returns metrics + the best-val-loss weights (W [2048,k], b) as numpy."""
     X, Xv = torch.as_tensor(X, device="cuda"), torch.as_tensor(Xv, device="cuda").float() / 255  # X stays int8, converted per batch
@@ -187,7 +187,7 @@ def train_head(X, y, Xv, yv, k, epochs, patience, bs=256, lr=1e-3):
     torch.manual_seed(0)
     head = torch.nn.Linear(2048, k).cuda()
     torch.nn.init.zeros_(head.weight); torch.nn.init.zeros_(head.bias)
-    opt = torch.optim.Adam(head.parameters(), lr=lr)
+    opt = torch.optim.Adam(head.parameters(), lr=lr, eps=eps)
     best, bad, ep = np.inf, 0, 0
     while epochs is None or ep < epochs:
         ep += 1
@@ -273,6 +273,8 @@ if __name__ == "__main__":
     ap.add_argument("data", nargs="?", default="cifar10")
     ap.add_argument("--epochs", type=int, help="default: until early stop")
     ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--eps", type=float, default=1e-8, help="Adam eps")
     ap.add_argument("--per-class", type=int, help="default: all")
     ap.add_argument("--test-per-class", type=int)
     a = ap.parse_args()
@@ -305,7 +307,7 @@ if __name__ == "__main__":
     nv = len(X) // 10
     v, t = perm[:nv], perm[nv:]
     t0 = time.perf_counter()
-    info, W, b = train_head(X[t], y[t], X[v], y[v], len(classes), a.epochs, a.patience)
+    info, W, b = train_head(X[t], y[t], X[v], y[v], len(classes), a.epochs, a.patience, lr=a.lr, eps=a.eps)
     tm["head_train_s"], tm["head_ms_per_epoch"] = time.perf_counter() - t0, (time.perf_counter() - t0) / info["epochs_run"] * 1e3
     head = quantize(W, b)
     acc = float(((Xt.astype(np.int64) @ head["W"].astype(np.int64) + head["b"]).argmax(1) == yt).mean())
@@ -323,7 +325,7 @@ if __name__ == "__main__":
     tm["eval_img_per_s"] = len(te) / (time.perf_counter() - t0)
     assert abs(acc_e - acc) < 0.01, f"engine accuracy {acc_e} != numpy int8 head {acc}"
     m = info | dict(test_acc_engine=acc_e, test_acc_int8_head=acc, test_acc_float_head=acc_f, train=len(t), val=nv, test=len(Xt),
-                    classes=len(classes), gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
+                    classes=len(classes), lr=a.lr, eps=a.eps, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
                     host_peak_ram_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)
     (run / "metrics.json").write_text(json.dumps(m, indent=1))
     print(run, json.dumps(m, indent=1))
