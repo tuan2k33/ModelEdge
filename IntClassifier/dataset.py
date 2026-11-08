@@ -1,7 +1,7 @@
 """Datasets. A loader returns (train PIL images, train labels, test PIL images, test labels, class names);
 per / test_per cap the images per class (None = all). To add a dataset: write a loader and register it in DATASETS.
 A directory with one subfolder per class also works (no registration)."""
-import collections, io, pickle, tarfile, urllib.request, zipfile
+import collections, io, pickle, subprocess, tarfile, zipfile
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +13,7 @@ DATA = Path("data")
 def fetch(url, path):
     if not path.exists():
         path.parent.mkdir(exist_ok=True)
-        urllib.request.urlretrieve(url, path)
+        subprocess.run(["curl", "-fsSL", "-C", "-", "-o", str(path), url], check=True)  # curl, not urllib: in this environment urlretrieve crawled (10 MB in over 90 s) while curl fetched 102 MB in 11 s
     return path
 
 

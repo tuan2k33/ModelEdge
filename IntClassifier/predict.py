@@ -5,7 +5,7 @@ from pathlib import Path
 import onnx
 from PIL import Image
 
-from train import Engine, infer
+from model import Engine, infer
 
 eng = Engine(sys.argv[1])
 label, conf = infer(eng, [Image.open(sys.argv[2])])
