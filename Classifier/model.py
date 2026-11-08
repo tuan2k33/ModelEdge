@@ -32,14 +32,12 @@ def front_end():
     """Nodes + initializers turning a uint8 NHWC `image` of any size into the normalized float NCHW `data` (inside the engine)."""
     f32 = lambda n, v: nh.from_array(np.array(v, np.float32).reshape(1, 3, 1, 1), n)
     i64 = lambda n, v: nh.from_array(np.array(v, np.int64), n)
-    inits = [f32("pre_scale", 1 / (255 * STD)), f32("pre_shift", -MEAN / STD), i64("pre_s0", [0]), i64("pre_s2", [2]), i64("pre_hw", [256, 256]),
-             i64("pre_lo", [16, 16]), i64("pre_hi", [240, 240]), i64("pre_ax", [2, 3])]
+    inits = [f32("pre_scale", 1 / (255 * STD)), f32("pre_shift", -MEAN / STD), i64("pre_s0", [0]), i64("pre_s2", [2]), i64("pre_hw", [224, 224])]
     nodes = [h.make_node("Cast", ["image"], ["pre_f0"], to=T.FLOAT), h.make_node("Transpose", ["pre_f0"], ["pre_f"], perm=[0, 3, 1, 2]),
              h.make_node("Shape", ["pre_f"], ["pre_shp"]), h.make_node("Slice", ["pre_shp", "pre_s0", "pre_s2"], ["pre_nc"]),
              h.make_node("Concat", ["pre_nc", "pre_hw"], ["pre_sizes"], axis=0),
              h.make_node("Resize", ["pre_f", "", "", "pre_sizes"], ["pre_r"], mode="linear", coordinate_transformation_mode="half_pixel"),
-             h.make_node("Slice", ["pre_r", "pre_lo", "pre_hi", "pre_ax"], ["pre_c"]),
-             h.make_node("Mul", ["pre_c", "pre_scale"], ["pre_m"]), h.make_node("Add", ["pre_m", "pre_shift"], ["data"])]
+             h.make_node("Mul", ["pre_r", "pre_scale"], ["pre_m"]), h.make_node("Add", ["pre_m", "pre_shift"], ["data"])]
     return nodes, inits
 
 

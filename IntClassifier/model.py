@@ -6,6 +6,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import tensorrt as trt
+import torch
 from cuda.bindings import runtime as cudart
 from onnx import TensorProto as T, helper as h, numpy_helper as nh
 
@@ -20,28 +21,29 @@ BATCH = 64
 
 
 def arr(img):
-    return np.asarray(img.convert("RGB"))
+    img = img.convert("RGB")
+    if max(img.size) > MAXHW:  # the engine takes sides up to MAXHW: shrink bigger photos here (antialiased, aspect kept)
+        img.thumbnail((MAXHW, MAXHW))
+    return np.asarray(img)
 
 
-def infer(eng, imgs):
-    """PIL images -> engine outputs; same-size images go in one batch, others one by one."""
+def infer(eng, imgs, gpu=False):
+    """PIL images -> engine outputs (numpy, or torch tensors on the GPU if gpu); same-size images go in one batch, others one by one."""
     a = [arr(i) for i in imgs]
-    parts = [eng(np.stack(a))] if len({x.shape for x in a}) == 1 else [eng(x[None]) for x in a]
-    return [np.concatenate(o) for o in zip(*parts)]
+    parts = [eng(np.stack(a), gpu)] if len({x.shape for x in a}) == 1 else [eng(x[None], gpu) for x in a]
+    return [(torch.cat if gpu else np.concatenate)(o) for o in zip(*parts)]
 
 
 def front_end():
     """Nodes + initializers turning a uint8 NHWC `image` of any size into the normalized float NCHW `data` (inside the engine)."""
     f32 = lambda n, v: nh.from_array(np.array(v, np.float32).reshape(1, 3, 1, 1), n)
     i64 = lambda n, v: nh.from_array(np.array(v, np.int64), n)
-    inits = [f32("pre_scale", 1 / (255 * STD)), f32("pre_shift", -MEAN / STD), i64("pre_s0", [0]), i64("pre_s2", [2]), i64("pre_hw", [256, 256]),
-             i64("pre_lo", [16, 16]), i64("pre_hi", [240, 240]), i64("pre_ax", [2, 3])]
+    inits = [f32("pre_scale", 1 / (255 * STD)), f32("pre_shift", -MEAN / STD), i64("pre_s0", [0]), i64("pre_s2", [2]), i64("pre_hw", [224, 224])]
     nodes = [h.make_node("Cast", ["image"], ["pre_f0"], to=T.FLOAT), h.make_node("Transpose", ["pre_f0"], ["pre_f"], perm=[0, 3, 1, 2]),
              h.make_node("Shape", ["pre_f"], ["pre_shp"]), h.make_node("Slice", ["pre_shp", "pre_s0", "pre_s2"], ["pre_nc"]),
              h.make_node("Concat", ["pre_nc", "pre_hw"], ["pre_sizes"], axis=0),
              h.make_node("Resize", ["pre_f", "", "", "pre_sizes"], ["pre_r"], mode="linear", coordinate_transformation_mode="half_pixel"),
-             h.make_node("Slice", ["pre_r", "pre_lo", "pre_hi", "pre_ax"], ["pre_c"]),
-             h.make_node("Mul", ["pre_c", "pre_scale"], ["pre_m"]), h.make_node("Add", ["pre_m", "pre_shift"], ["data"])]
+             h.make_node("Mul", ["pre_r", "pre_scale"], ["pre_m"]), h.make_node("Add", ["pre_m", "pre_shift"], ["data"])]
     return nodes, inits
 
 
@@ -63,8 +65,8 @@ def qdq_backbone():
     Activation scale s -> 2s for zp 0 (post-ReLU, loses 1 bit) or max(zp, 255-zp)*s/127 otherwise (~lossless). TensorRT 11
     builds uint8 Q/DQ but runs it wrong (engine != ORT), hence int8. Embeddings end up cos ~0.9 vs the original model.
     A zp-0 output was an implicit ReLU (uint8 saturation), so it becomes an explicit Relu. Input: uint8 NHWC image,
-    resized to 256x256 (squashed, bilinear, no antialias: shortcut, fine for small or square images; downscaling big photos aliases),
-    center-cropped to 224 and normalized by float nodes, all inside the engine. Output: the int8 global-avg-pool tensor [N,2048] as is (>= 0, post-ReLU)."""
+    resized straight to 224x224 (squashed, bilinear, no antialias: shortcut, fine for small or square images; downscaling big photos aliases),
+    normalized by float nodes, all inside the engine. Output: the int8 global-avg-pool tensor [N,2048] as is (>= 0, post-ReLU)."""
     z = zoo_cut()
     init = {i.name: i for i in z.graph.initializer}
     val = {k: nh.to_array(v) for k, v in init.items()}
@@ -127,8 +129,9 @@ def qdq_backbone():
 
 
 class Engine:
-    """TensorRT engine runner: uint8 [N,H,W,3] (H, W <= MAXHW) -> list of output arrays, N <= BATCH."""
+    """TensorRT engine runner: uint8 [N,H,W,3] (H, W <= MAXHW) -> list of output arrays (torch tensors on the GPU if gpu), N <= BATCH."""
     DT = {trt.float32: np.float32, trt.int32: np.int32, trt.int8: np.int8}
+    TDT = {np.float32: torch.float32, np.int32: torch.int32, np.int8: torch.int8}
 
     def __init__(self, path):
         self.e = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(Path(path).read_bytes())
@@ -140,9 +143,9 @@ class Engine:
                      if self.e.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT]
         self.dout = [cudart.cudaMalloc(BATCH * int(np.prod(sh)) * np.dtype(dt).itemsize)[1] for _, dt, sh in self.outs]
 
-    def __call__(self, imgs):
+    def __call__(self, imgs, gpu=False):
         x, n = np.ascontiguousarray(imgs), len(imgs)
-        ys = [np.empty((n, *sh), dt) for _, dt, sh in self.outs]
+        ys = [torch.empty((n, *sh), dtype=self.TDT[dt], device="cuda") if gpu else np.empty((n, *sh), dt) for _, dt, sh in self.outs]
         self.ctx.set_input_shape("image", x.shape)
         self.ctx.set_tensor_address("image", int(self.din))
         for (name, _, _), d in zip(self.outs, self.dout):
@@ -151,7 +154,10 @@ class Engine:
         assert self.ctx.execute_async_v3(int(self.stream))
         cudart.cudaStreamSynchronize(self.stream)
         for y, d in zip(ys, self.dout):
-            cudart.cudaMemcpy(y.ctypes.data, d, y.nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
+            if gpu:
+                cudart.cudaMemcpy(y.data_ptr(), d, y.nelement() * y.element_size(), cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice)
+            else:
+                cudart.cudaMemcpy(y.ctypes.data, d, y.nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost)
         return ys
 
 
@@ -180,15 +186,16 @@ def build_engine(sample):
 def quantize(W, b, W2=None, b2=None, hmax=None):
     """Linear head (W [2048,k], b) -> int8 weights, int32 bias, LUT softmax constants. With W2/b2/hmax it is Linear(2048,H) + ReLU + Linear(H,k):
     the ReLU output is requantized to int8 with scale 127/hmax (hmax = 99.9th percentile of that output, measured at the saved weights)."""
-    W = W / 255  # fold /255 so the head takes the raw int8 embedding
-    s = 127 / np.abs(W).max()
-    q = lambda A, sc: np.round(A * sc).astype(np.int8)
+    t = lambda A: None if A is None else torch.as_tensor(A, device="cuda", dtype=torch.float64)  # rounding on the GPU, results back as numpy for the ONNX graph
+    W, b, W2, b2 = t(W) / 255, t(b), t(W2), t(b2)  # fold /255 so the head takes the raw int8 embedding
+    s = float(127 / W.abs().max())
+    q = lambda A, sc: torch.round(A * sc).to(torch.int8).cpu().numpy()
+    qi = lambda A, sc: torch.round(A * sc).to(torch.int32).cpu().numpy()
     lut = np.round(65535 * np.exp(-np.arange(256) / LUT_STEP)).astype(np.uint16)
     if W2 is None:
-        return dict(W=q(W, s), b=np.round(b * s).astype(np.int32), M=round(LUT_STEP / s * 65536), lut=lut)
-    sh, s2 = 127 / hmax, 127 / np.abs(W2).max()  # logits end up in units of 1/(sh*s2)
-    return dict(W1=q(W, s), b1=np.round(b * s).astype(np.int32), m1=s / sh, W=q(W2, s2), b=np.round(b2 * sh * s2).astype(np.int32),
-                M=round(LUT_STEP / (sh * s2) * 65536), lut=lut)
+        return dict(W=q(W, s), b=qi(b, s), M=round(LUT_STEP / s * 65536), lut=lut)
+    sh, s2 = 127 / hmax, float(127 / W2.abs().max())  # logits end up in units of 1/(sh*s2)
+    return dict(W1=q(W, s), b1=qi(b, s), m1=s / sh, W=q(W2, s2), b=qi(b2, sh * s2), M=round(LUT_STEP / (sh * s2) * 65536), lut=lut)
 
 
 def build_model(head, classes):
