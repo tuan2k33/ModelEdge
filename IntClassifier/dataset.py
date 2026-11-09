@@ -88,4 +88,4 @@ DATASETS = {"cifar10": cifar10, "cifar100": cifar100, "mnist": mnist, "tiny-imag
 
 
 def load(name, per=None, test_per=None):
-    return DATASETS[name](per, test_per) if name in DATASETS else folder(name, per, test_per)
+    return DATASETS[name](per, test_per) if name in DATASETS else folder(name if Path(name).exists() else DATA / name, per, test_per)

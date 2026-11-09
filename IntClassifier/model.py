@@ -14,7 +14,6 @@ CACHE = Path("cache")
 ZOO = CACHE / "zoo-int8" / "resnet50-v1-12-int8.onnx"
 ZOO_URL = "https://huggingface.co/onnxmodelzoo/resnet50-v1-12-int8/resolve/main/resnet50-v1-12-int8.onnx"
 POOL = "resnetv17_pool1_fwd_quantized"  # uint8 [N,2048,1,1] after the global average pool in the zoo model, int8 after conversion
-LUT_STEP = 16  # LUT index = logit gap * 16; 256 entries cover gaps up to 16
 MEAN, STD = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
 MAXHW = 512  # largest input side the engine accepts (batch x side^2 x float32 temp must fit the GPU)
 BATCH = 64
@@ -184,29 +183,27 @@ def build_engine(sample):
 
 
 def quantize(W, b, W2=None, b2=None, hmax=None):
-    """Linear head (W [2048,k], b) -> int8 weights, int32 bias, LUT softmax constants. With W2/b2/hmax it is Linear(2048,H) + ReLU + Linear(H,k):
+    """Linear head (W [2048,k], b) -> int8 weights, int32 bias, S (logits are integers in units of 1/S). With W2/b2/hmax it is Linear(2048,H) + ReLU + Linear(H,k):
     the ReLU output is requantized to int8 with scale 127/hmax (hmax = 99.9th percentile of that output, measured at the saved weights)."""
     t = lambda A: None if A is None else torch.as_tensor(A, device="cuda", dtype=torch.float64)  # rounding on the GPU, results back as numpy for the ONNX graph
     W, b, W2, b2 = t(W) / 255, t(b), t(W2), t(b2)  # fold /255 so the head takes the raw int8 embedding
     s = float(127 / W.abs().max())
     q = lambda A, sc: torch.round(A * sc).to(torch.int8).cpu().numpy()
     qi = lambda A, sc: torch.round(A * sc).to(torch.int32).cpu().numpy()
-    lut = np.round(65535 * np.exp(-np.arange(256) / LUT_STEP)).astype(np.uint16)
     if W2 is None:
-        return dict(W=q(W, s), b=qi(b, s), M=round(LUT_STEP / s * 65536), lut=lut)
+        return dict(W=q(W, s), b=qi(b, s), S=1 / s)
     sh, s2 = 127 / hmax, float(127 / W2.abs().max())  # logits end up in units of 1/(sh*s2)
-    return dict(W1=q(W, s), b1=qi(b, s), m1=s / sh, W=q(W2, s2), b=qi(b2, sh * s2), M=round(LUT_STEP / (sh * s2) * 65536), lut=lut)
+    return dict(W1=q(W, s), b1=qi(b, s), m1=s / sh, W=q(W2, s2), b=qi(b2, sh * s2), S=1 / (sh * s2))
 
 
 def build_model(head, classes):
-    """Backbone QDQ + head in one graph, TensorRT-parseable: uint8 image -> label, conf%. The backbone's int8 pool tensor feeds the int8 x int8 GEMM(s)
-    directly (DQ with scale 1, so a GEMM output is the int32 accumulator). Bias, ReLU and the LUT softmax on a few numbers are float ops on integer
-    values: TensorRT has no BitShift/MatMulInteger and int32 d*M could overflow."""
+    """Backbone QDQ + head in one graph, TensorRT-parseable: uint8 image -> label, logits (float [N,classes], one per class; sigmoid(logit) is that class's confidence, left to the caller). The backbone's int8
+    pool tensor feeds the int8 x int8 GEMM(s) directly (DQ with scale 1, so a GEMM output is the int32 accumulator). Bias and ReLU are float ops on integer
+    values: TensorRT has no BitShift/MatMulInteger."""
     m = onnx.load(CACHE / "backbone-qdq.onnx")
     g = m.graph
     f = lambda n, v: nh.from_array(np.array(v, np.float32), n)
-    g.initializer.extend([f("one", 1.0), nh.from_array(np.array(0, np.int8), "zero"), nh.from_array(head["W"], "Wq"), f("b", head["b"]), f("lo", 0),
-                          f("lut", head["lut"]), f("mul", head["M"] / 65536), f("top", 255), f("pct", 100 * 65535), nh.from_array(np.array([1], np.int64), "ax")])
+    g.initializer.extend([f("one", 1.0), nh.from_array(np.array(0, np.int8), "zero"), nh.from_array(head["W"], "Wq"), f("b", head["b"]), f("lo", 0)])
     n = h.make_node
     nodes, x = [n("DequantizeLinear", ["feat_q", "one", "zero"], ["feat"])], "feat"
     if "W1" in head:  # hidden layer: int8 GEMM, +bias, ReLU, requantize to int8 for the second GEMM
@@ -217,14 +214,13 @@ def build_model(head, classes):
                   n("Relu", ["u0"], ["u"]), n("Mul", ["u", "inv_m1"], ["uq"]), n("Round", ["uq"], ["ur"]), n("Clip", ["ur", "lo", "c127"], ["hr"]),
                   n("QuantizeLinear", ["hr", "one", "zero"], ["hq"]), n("DequantizeLinear", ["hq", "one", "zero"], ["hf"])]
         x = "hf"
-    nodes += [
-        n("DequantizeLinear", ["Wq", "one", "zero"], ["Wf"]), n("MatMul", [x, "Wf"], ["acc"]), n("Add", ["acc", "b"], ["z"]),
-        n("ArgMax", ["z"], ["l64"], axis=1, keepdims=0), n("Cast", ["l64"], ["label"], to=T.INT32),
-        n("ReduceMax", ["z"], ["zmax"], axes=[1], keepdims=1), n("Sub", ["zmax", "z"], ["d"]), n("Mul", ["d", "mul"], ["d2"]),
-        n("Clip", ["d2", "lo", "top"], ["d3"]), n("Cast", ["d3"], ["idx"], to=T.INT32), n("Gather", ["lut", "idx"], ["ex"]),
-        n("ReduceSum", ["ex", "ax"], ["esum"], keepdims=0), n("Div", ["pct", "esum"], ["c"]), n("Cast", ["c"], ["conf"], to=T.INT32)]
+    nodes += [n("DequantizeLinear", ["Wq", "one", "zero"], ["Wf"]), n("MatMul", [x, "Wf"], ["acc"]), n("Add", ["acc", "b"], ["z"]),
+              n("ArgMax", ["z"], ["l64"], axis=1, keepdims=0), n("Cast", ["l64"], ["label"], to=T.INT32)]
+    g.initializer.append(f("S", head["S"]))  # the head's logits are integers in units of 1/S
+    nodes.append(n("Mul", ["z", "S"], ["logits"]))
+    out = [h.make_tensor_value_info("label", T.INT32, [None]), h.make_tensor_value_info("logits", T.FLOAT, [None, len(classes)])]
     g.node.extend(nodes)
     del g.output[:]
-    g.output.extend([h.make_tensor_value_info("label", T.INT32, [None]), h.make_tensor_value_info("conf", T.INT32, [None])])
+    g.output.extend(out)
     m.metadata_props.add(key="classes", value=json.dumps(list(classes)))
     return m

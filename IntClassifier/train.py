@@ -1,9 +1,8 @@
-"""python train.py [cifar10|tiny-imagenet|<dir with train/ and test/ class subfolders>] [--epochs N] [--stages lr:patience,...] [--per-class N]  (loaders: dataset.py, model: model.py)
-Backbone: ONNX Model Zoo ResNet50 INT8 QDQ -> TensorRT INT8 engine on the GPU (cached). Head: linear softmax on the int8 embeddings, torch on the GPU
-(Adam, staged lr with shrinking patience, 10% val split, best-val-loss weights kept; no --epochs = until the last stage stalls), quantized to int8 and appended to the
-backbone with a LUT softmax. Output: weight/run-<time>/{model.onnx,model.engine,metrics.json,train.log}: uint8 image -> label, confidence %."""
-import argparse, json, resource, sys, time
-from datetime import datetime
+"""python train.py [cifar10|cifar100|mnist|tiny-imagenet|<dataset dir>] [--epochs N] [--stages lr:patience,...] [--per-class N]  (loaders: dataset.py, model: model.py)
+A dataset dir has train/ and test/ class subfolders; a bare name is looked up in data/. Backbone: ONNX Model Zoo ResNet50 INT8 QDQ -> TensorRT INT8 engine on the GPU (cached).
+Head: MLP on the int8 embeddings, one sigmoid per class (BCE), torch on the GPU (Adam, staged lr with shrinking patience, 10% val split, best-val-loss weights kept;
+no --epochs = until the last stage stalls), quantized to int8 and appended to the backbone. Output: weight/<dataset>/{model.onnx,model.engine,metrics.json,train.log}: uint8 image -> label, logits (the confidence of a class is sigmoid(logit), see predict.py)."""
+import argparse, json, resource, shutil, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -23,13 +22,19 @@ class Tee:
     def flush(self): [f.flush() for f in self.fs]
 
 
+def head_loss(z, y, reduction="mean"):
+    """One sigmoid per class against the one-hot target, summed over the classes."""
+    l = F.binary_cross_entropy_with_logits(z, F.one_hot(y, z.shape[1]).to(z.dtype), reduction="none").sum(1)
+    return l.mean() if reduction == "mean" else l.sum()
+
+
 @torch.no_grad()
 def train_stats(head, X, y, scale):
     """Loss and accuracy of the (best) head on the whole train set, in chunks."""
     loss = acc = 0
     for i in range(0, len(X), 8192):
         z = head(X[i:i + 8192].float() / scale)
-        loss += F.cross_entropy(z, y[i:i + 8192], reduction="sum").item(); acc += (z.argmax(1) == y[i:i + 8192]).sum().item()
+        loss += head_loss(z, y[i:i + 8192], "sum").item(); acc += (z.argmax(1) == y[i:i + 8192]).sum().item()
     return dict(train_loss=loss / len(X), train_acc=acc / len(X))
 
 
@@ -46,6 +51,7 @@ def train_head(X, y, Xv, yv, k, epochs, stages, bs=1024, eps=1e-8, seed=0, hidde
     else:
         head = torch.nn.Linear(2048, k).cuda()
         torch.nn.init.zeros_(head.weight); torch.nn.init.zeros_(head.bias)
+    torch.nn.init.constant_((head[2] if hidden else head).bias, -float(np.log(k - 1)))  # start at the prior of "none of the classes", or the k-1 negatives dominate the first steps
     opt = torch.optim.Adam(head.parameters(), lr=stages[0][0], eps=eps)
     best, bad, ep, stage = np.inf, 0, 0, 0
     while epochs is None or ep < epochs:
@@ -54,11 +60,11 @@ def train_head(X, y, Xv, yv, k, epochs, stages, bs=1024, eps=1e-8, seed=0, hidde
         for i in range(0, len(X), bs):
             j = idx[i:i + bs]
             opt.zero_grad()
-            F.cross_entropy(head(X[j].float() / scale), y[j]).backward()
+            head_loss(head(X[j].float() / scale), y[j]).backward()
             opt.step()
         with torch.no_grad():
             z = head(Xv)
-            loss, acc = F.cross_entropy(z, yv).item(), (z.argmax(1) == yv).float().mean().item()
+            loss, acc = head_loss(z, yv).item(), (z.argmax(1) == yv).float().mean().item()
         print(f"epoch {ep} val_loss {loss:.4f} val_acc {acc:.4f} lr {stages[stage][0]:.0e}", flush=True)
         if loss < best - 1e-4:
             best, bad, info = loss, 0, dict(best_epoch=ep, val_loss=loss, val_acc=acc)
@@ -76,40 +82,6 @@ def train_head(X, y, Xv, yv, k, epochs, stages, bs=1024, eps=1e-8, seed=0, hidde
     head.load_state_dict(state)
     info |= train_stats(head, X, y, scale)
     torch.cuda.empty_cache()  # give the GPU back before trtexec builds the final engine
-    return info | dict(epochs_run=ep), head
-
-
-def fit_lbfgs(X, y, Xv, yv, k, patience=3, chunk=10, max_rounds=100, seed=0):
-    """Linear head only (convex), full-batch L-BFGS on the GPU: no lr to tune. One "epoch" here = `chunk` L-BFGS iterations; keeps the
-    best-val-loss weights and stops after `patience` epochs without gain. Same return value as train_head."""
-    X, Xv = torch.as_tensor(X, device="cuda").float() / 255, torch.as_tensor(Xv, device="cuda").float() / 255
-    y, yv = torch.as_tensor(y, device="cuda").long(), torch.as_tensor(yv, device="cuda").long()
-    head = torch.nn.Linear(2048, k).cuda()
-    torch.nn.init.zeros_(head.weight); torch.nn.init.zeros_(head.bias)
-    opt = torch.optim.LBFGS(head.parameters(), lr=1, max_iter=chunk, history_size=20, line_search_fn="strong_wolfe")
-
-    def closure():
-        opt.zero_grad()
-        loss = F.cross_entropy(head(X), y)
-        loss.backward()
-        return loss
-
-    best, bad = np.inf, 0
-    for ep in range(1, max_rounds + 1):
-        opt.step(closure)
-        with torch.no_grad():
-            z = head(Xv)
-            loss, acc = F.cross_entropy(z, yv).item(), (z.argmax(1) == yv).float().mean().item()
-        print(f"epoch {ep} val_loss {loss:.4f} val_acc {acc:.4f} lbfgs_iters {ep * chunk}", flush=True)
-        if loss < best - 1e-4:
-            best, bad, info = loss, 0, dict(best_epoch=ep, val_loss=loss, val_acc=acc)
-            state = {n: p.clone() for n, p in head.state_dict().items()}
-        elif (bad := bad + 1) >= patience:
-            break
-    head.load_state_dict(state)
-    info |= train_stats(head, X, y, 1)
-    del X, Xv
-    torch.cuda.empty_cache()
     return info | dict(epochs_run=ep), head
 
 
@@ -137,14 +109,13 @@ if __name__ == "__main__":
     ap.add_argument("--stages", default="1e-3:10,5e-4:8,2e-4:6,1e-4:4", help="lr:patience,... ; each stage ends after `patience` epochs without val-loss gain")
     ap.add_argument("--eps", type=float, default=1e-8, help="Adam eps")
     ap.add_argument("--bs", type=int, default=1024, help="head batch size")
-    ap.add_argument("--solver", choices=["adam", "lbfgs"], default="adam", help="lbfgs: linear head only, no lr/stages")
     ap.add_argument("--hidden", type=int, default=1024, help="hidden layer width of the MLP head; 0 = linear head")
     ap.add_argument("--seed", type=int, help="val split + batch order; default: random (printed and saved in metrics.json)")
     ap.add_argument("--per-class", type=int, help="default: all")
     ap.add_argument("--test-per-class", type=int)
     a = ap.parse_args()
-    run = Path("weight") / datetime.now().strftime("run-%Y%m%d-%H%M%S")
-    run.mkdir(parents=True)
+    run = Path("weight") / Path(a.data).name  # a new run replaces the previous one of the same dataset
+    shutil.rmtree(run, ignore_errors=True); run.mkdir(parents=True)
     sys.stdout = Tee(sys.stdout, open(run / "train.log", "w"))
     feats = CACHE / f"{Path(a.data).name}-pool-{a.per_class}-{a.test_per_class}.npz"
     T0 = time.perf_counter(); cudart.cudaFree(0); gpu = dict(base=gpu_mb())
@@ -175,12 +146,8 @@ if __name__ == "__main__":
     nv = len(X) // 10
     v, t = perm[:nv], perm[nv:]
     t0 = time.perf_counter()
-    if a.solver == "lbfgs":
-        assert not a.hidden, "lbfgs is for the linear head"
-        info, head_t = fit_lbfgs(X[t], yg[t], X[v], yg[v], len(classes))
-    else:
-        info, head_t = train_head(X[t], yg[t], X[v], yg[v], len(classes), a.epochs, [(float(l), int(p)) for l, p in (x.split(":") for x in a.stages.split(","))],
-                                  bs=a.bs, eps=a.eps, seed=seed, hidden=a.hidden)
+    info, head_t = train_head(X[t], yg[t], X[v], yg[v], len(classes), a.epochs, [(float(l), int(p)) for l, p in (x.split(":") for x in a.stages.split(","))],
+                              bs=a.bs, eps=a.eps, seed=seed, hidden=a.hidden)
     tm["head_train_s"], tm["head_ms_per_epoch"] = time.perf_counter() - t0, (time.perf_counter() - t0) / info["epochs_run"] * 1e3
     if a.hidden:
         l1, l2 = head_t[0], head_t[2]
@@ -192,7 +159,8 @@ if __name__ == "__main__":
         z = Xt.double()
         if a.hidden:
             z = torch.round(torch.relu(z @ g("W1") + g("b1")) / head["m1"]).clamp(0, 127)
-        acc = ((z @ g("W") + g("b")).argmax(1) == ytg).double().mean().item()
+        z = z @ g("W") + g("b")
+        acc = (z.argmax(1) == ytg).double().mean().item()
 
     onnx.save(build_model(head, classes), run / "model.onnx")
     t0 = time.perf_counter()
@@ -205,8 +173,10 @@ if __name__ == "__main__":
     acc_e = float(np.mean(np.concatenate([infer(fe, te[s:s + BATCH])[0] for s in range(0, len(te), BATCH)]) == yt))
     tm["eval_img_per_s"] = len(te) / (time.perf_counter() - t0)
     assert abs(acc_e - acc) < 0.01, f"engine accuracy {acc_e} != numpy int8 head {acc}"
+    lg = infer(fe, te[:BATCH])[1]
+    assert np.allclose(lg, (z[:BATCH] * head["S"]).cpu().numpy(), atol=1e-3 * np.abs(lg).max()), "engine logits != int8 head logits"
     m = dict(data=a.data) | info | dict(test_acc=acc_e, train=len(t), val=nv, test=len(Xt),
-                    classes=len(classes), hidden=a.hidden, stages=a.stages, eps=a.eps, bs=a.bs, solver=a.solver, seed=seed, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
+                    classes=len(classes), hidden=a.hidden, stages=a.stages, eps=a.eps, bs=a.bs, seed=seed, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
                     host_peak_ram_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)
     (run / "metrics.json").write_text(json.dumps(m, indent=1))
     print(run, json.dumps(m, indent=1))
