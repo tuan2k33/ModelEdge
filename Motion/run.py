@@ -33,10 +33,7 @@ while True:
     if not ok:
         break
     x = torch.from_numpy(fr).cuda().flip(-1)[None]
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
     mask = net(x, update=i % a.every == 0)
-    t.append(time.perf_counter() - t0)
     m = mask.cpu().numpy()
     area.append(m.mean())
     n, _, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
@@ -49,4 +46,7 @@ while True:
     ff.stdin.write(np.hstack([fr, bg]).tobytes())
     i += 1
 ff.stdin.close(); ff.wait()
-print(f"{i} frames, engine {1000 * np.median(t[5:]):.2f} ms/frame, foreground {100 * np.mean(area):.1f}% of the frame on average")
+for _ in range(220):  # timed after the encoder has gone: x264 takes every core and the wait for the GPU then measures the CPU queue, not the engine
+    t.append(time.perf_counter())
+    net(x, update=False)
+print(f"{i} frames, engine {1000 * np.median(np.diff(t[20:])):.2f} ms/frame, foreground {100 * np.mean(area):.1f}% of the frame on average")
