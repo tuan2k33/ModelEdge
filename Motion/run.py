@@ -1,5 +1,5 @@
 """Background model on a video: left the frame with the moving regions boxed, right the background it has learned. H264 out.
-    python run.py in.mp4 out.mp4 [--every 5] [--cap 5] [--thr 25]"""
+    python run.py in.mp4 out.mp4 [--every 5] [--form 5] [--cap 600] [--thr 25]"""
 import argparse, subprocess, time
 
 import cv2, numpy as np, torch
@@ -10,17 +10,18 @@ ap = argparse.ArgumentParser()
 ap.add_argument("video")
 ap.add_argument("out")
 ap.add_argument("--every", type=int, default=5, help="update the background every Nth frame (the mask is computed on all of them)")
-ap.add_argument("--cap", type=float, default=5, help="seconds: the longest a background is trusted for, so also how long a still object takes to become background")
+ap.add_argument("--form", type=float, default=5, help="seconds something must stay the same to become background where there is none yet")
+ap.add_argument("--cap", type=float, default=600, help="seconds: the most weight a background can gather, so the longest a still object stays an object (and a moved one takes to be accepted)")
 ap.add_argument("--thr", type=float, default=25, help="a pixel matches when no channel differs by more than this (0..255)")
 ap.add_argument("--min-area", type=int, default=12, help="smallest box, in mask pixels")
 a = ap.parse_args()
 
 cap = cv2.VideoCapture(a.video)
 fps, w0, h0 = cap.get(cv2.CAP_PROP_FPS), int(cap.get(3)), int(cap.get(4))
-updates = max(1, round(a.cap * fps / a.every))
-eng = CACHE / f"bg-{updates}-{a.thr:g}.engine"
+form, top = (max(1, round(s * fps / a.every)) for s in (a.form, a.cap))
+eng = CACHE / f"bg-{form}-{top}-{a.thr:g}.engine"
 if not eng.exists():
-    export(eng.with_suffix(".onnx"), updates, a.thr)
+    export(eng.with_suffix(".onnx"), form, top, a.thr)
     compile_engine(eng.with_suffix(".onnx"), eng)
 net = Engine(eng)
 
