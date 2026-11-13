@@ -39,7 +39,7 @@ while True:
     m = net(torch.from_numpy(low).cuda().flip(-1)[None], update=i % 5 == 0)
     if i >= 20 * fps and i % 15 == 0:
         frames.append((fr, low))
-        masks.append(m.cpu().numpy().copy())
+        masks.append(m[0].cpu().numpy())
     i += 1
 del net
 out = {"masks": np.stack(masks), "shape": np.array(frames[0][0].shape[:2])}

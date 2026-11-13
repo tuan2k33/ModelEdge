@@ -1,5 +1,6 @@
 """Background model for a fixed camera as one TensorRT engine with its memory passed in and out, no trained weights.
-Inputs: `image` uint8 [1,H,W,3] RGB, `state` float [1,8,PH,PW] (zeros at the start). Outputs: `state_out` (same layout), `mask` uint8 [1,1,PH,PW] (1 = differs from the background).
+Inputs: `image` uint8 [B,H,W,3] RGB, `state` float [B,8,PH,PW] (zeros at the start). Outputs: `state_out` (same layout), `mask` uint8 [B,1,PH,PW] (1 = differs from the background).
+A row is one camera: the rows do not see each other, and the caller hands each row the state of its own camera (Engine does).
 State channels: 0-2 background RGB, 3 its weight (updates it has been seen for, at most `cap`), 4-6 candidate RGB, 7 candidate count.
 A pixel that matches the background raises its weight; one that does not feeds the candidate, which replaces the background once its count passes that weight (at the start the weight is 0, so the first frame is the background).
 When most of the frame stops matching at once, the weights drop to `form` so the background re-forms in that time."""
@@ -18,7 +19,7 @@ POOL = 4
 MAXHW = 2160
 ALPHA = 0.05  # a matched background pixel moves at least this far towards the frame per update, so it follows slow light changes however old it is
 FLOOD = 0.5
-VER = 2  # part of the engine file name: raise it when the graph changes
+VER = 3  # part of the engine file name: raise it when the graph changes
 CACHE = Path("cache")
 
 
@@ -34,7 +35,7 @@ class Background(torch.nn.Module):
         hit = ((x - bg).abs().amax(1, keepdim=True) < self.thr) & (w > 0)
         hit_c = ((x - cand).abs().amax(1, keepdim=True) < self.thr) & (cnt > 0)
 
-        flood = (~hit).float().mean() > FLOOD  # most of the frame changed at once: the light, not objects, so the background is re-formed
+        flood = (~hit).float().mean((1, 2, 3), keepdim=True) > FLOOD  # most of the frame changed at once: the light, not objects, so the background is re-formed
         w = torch.where(flood, w.clamp(max=self.form), w)
         w1 = torch.where(hit, (w + 1).clamp(max=self.cap), w)
         bg1 = torch.where(hit, bg + (x - bg) * (1 / w1.clamp(min=1)).clamp(min=ALPHA), bg)
@@ -53,11 +54,11 @@ class Background(torch.nn.Module):
 def export(path, form, cap, thr, opset=17):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(Background(form, cap, thr), (torch.zeros(1, 540, 960, 3, dtype=torch.uint8), torch.zeros(1, 8, PH, PW)), str(path), dynamo=False, opset_version=opset,
-                      input_names=["image", "state"], output_names=["state_out", "mask"], dynamic_axes={"image": {1: "H", 2: "W"}})
+                      input_names=["image", "state"], output_names=["state_out", "mask"], dynamic_axes={"image": {0: "B", 1: "H", 2: "W"}, "state": {0: "B"}, "state_out": {0: "B"}, "mask": {0: "B"}})
 
 
 def fuse(det_onnx, path, form, cap, thr, boost):
-    """One ONNX from the Detector's model.onnx and the background model: `image`, `state` -> `detections` [1,300,6], `state_out`, `mask`.
+    """One ONNX from the Detector's model.onnx and the background model: `image`, `state` -> `detections` [1,300,6], `state_out`, `mask`. Batch 1, like the Detector.
     A box whose centre is on the mask gets `boost` added to the logit of its score (the rows stay in the detector's order, no longer sorted by score)."""
     det = onnx.load(det_onnx)
     export(path, form, cap, thr, det.opset_import[0].version)
@@ -99,39 +100,45 @@ def fuse(det_onnx, path, form, cap, thr, boost):
     onnx.save(det, path)
 
 
-def compile_engine(onnx_path, engine_path, top=(MAXHW, MAXHW * 2)):
-    """top: the largest frame, height and width (the fused engine needs it smaller: the detector's letterbox works on the full frame)."""
-    r = subprocess.run(["trtexec", f"--onnx={onnx_path}", f"--saveEngine={engine_path}", "--minShapes=image:1x90x160x3",
-                        "--optShapes=image:1x1080x1920x3", f"--maxShapes=image:1x{top[0]}x{top[1]}x3"], capture_output=True, text=True)
+def compile_engine(onnx_path, engine_path, top=(MAXHW, MAXHW * 2), batch=1):
+    """top: the largest frame, height and width (the fused engine needs it smaller: the detector's letterbox works on the full frame). batch: the most rows (cameras) per call."""
+    shapes = lambda b, hw: f"image:{b}x{hw[0]}x{hw[1]}x3,state:{b}x8x{PH}x{PW}"
+    r = subprocess.run(["trtexec", f"--onnx={onnx_path}", f"--saveEngine={engine_path}", f"--minShapes={shapes(1, (90, 160))}",
+                        f"--optShapes={shapes(batch, (min(1080, top[0]), min(1920, top[1])))}", f"--maxShapes={shapes(batch, top)}"], capture_output=True, text=True)
     assert r.returncode == 0, "\n".join(l for l in (r.stdout + r.stderr).splitlines() if "[E]" in l)
 
 
 class Engine:
-    """uint8 [1,H,W,3] cuda tensor -> mask uint8 [PH,PW] cuda tensor. The state stays on the GPU; update=False leaves it as it was (mask only)."""
+    """uint8 [B,H,W,3] cuda tensor (one row per camera, all the same size) -> mask uint8 [B,PH,PW] cuda tensor.
+    The background of every camera stays on the GPU in `store`, one row per camera id: `ids` says which camera each row of the batch is (default 0..B-1),
+    so the rows may come in any order. update (one bool, or one per row) False leaves that camera's background as it was (mask only)."""
 
-    def __init__(self, path):
+    def __init__(self, path, cameras=1):
         e = trt.Runtime(trt.Logger(trt.Logger.WARNING)).deserialize_cuda_engine(Path(path).read_bytes())
         self.ctx = e.create_execution_context()
-        self.state = torch.zeros(1, 8, PH, PW, device="cuda")
-        self.next = torch.zeros_like(self.state)
-        self.mask = torch.zeros(1, 1, PH, PW, dtype=torch.uint8, device="cuda")
+        rows = e.get_tensor_profile_shape("state", 0)[2][0]
+        self.store = torch.zeros(cameras, 8, PH, PW, device="cuda")
+        self.next = torch.zeros(rows, 8, PH, PW, device="cuda")
+        self.mask = torch.zeros(rows, 1, PH, PW, dtype=torch.uint8, device="cuda")
+        self.ctx.set_tensor_address("state_out", self.next.data_ptr())
         self.ctx.set_tensor_address("mask", self.mask.data_ptr())
         self.det = torch.zeros(1, 300, 6, device="cuda") if "detections" in [e.get_tensor_name(i) for i in range(e.num_io_tensors)] else None  # fuse()
         if self.det is not None:
             self.ctx.set_tensor_address("detections", self.det.data_ptr())
 
-    def __call__(self, image, update=True):
-        image = image.contiguous()
+    def __call__(self, image, ids=None, update=True):
+        image, n = image.contiguous(), len(image)
+        ids = torch.arange(n, device="cuda") if ids is None else torch.as_tensor(ids, device="cuda")
+        state = self.store[ids]
         self.ctx.set_input_shape("image", tuple(image.shape))
+        self.ctx.set_input_shape("state", tuple(state.shape))
         self.ctx.set_tensor_address("image", image.data_ptr())
-        self.ctx.set_tensor_address("state", self.state.data_ptr())
-        self.ctx.set_tensor_address("state_out", self.next.data_ptr())
+        self.ctx.set_tensor_address("state", state.data_ptr())
         assert self.ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
-        if update:
-            self.state, self.next = self.next, self.state
-        return self.mask[0, 0]
+        keep = torch.as_tensor(update, device="cuda").expand(n)
+        self.store[ids[keep]] = self.next[:n][keep]
+        return self.mask[:n, 0]
 
-    @property
-    def background(self):
-        return self.state[0, :3].permute(1, 2, 0).clamp(0, 255).to(torch.uint8)
+    def background(self, camera=0):
+        return self.store[camera, :3].permute(1, 2, 0).clamp(0, 255).to(torch.uint8)

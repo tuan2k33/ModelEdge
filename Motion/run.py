@@ -47,8 +47,7 @@ while True:
     if not ok:
         break
     x = torch.from_numpy(fr).cuda().flip(-1)[None]
-    mask = net(x, update=i % a.every == 0)
-    m = mask.cpu().numpy()
+    m = net(x, update=i % a.every == 0)[0].cpu().numpy()
     area.append(m.mean())
     n, _, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     big = cv2.resize(m, (w0, h0), interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -62,7 +61,7 @@ while True:
     for x1, y1, bw, bh, s in [] if a.detector else stats[1:]:
         if s >= a.min_area:
             cv2.rectangle(fr, (x1 * w0 // PW, y1 * h0 // PH), ((x1 + bw) * w0 // PW, (y1 + bh) * h0 // PH), (0, 255, 0), 2)
-    bg = cv2.resize(net.background.flip(-1).cpu().numpy(), (w0, h0))
+    bg = cv2.resize(net.background().flip(-1).cpu().numpy(), (w0, h0))
     ff.stdin.write(np.hstack([fr, bg]).tobytes())
     i += 1
 ff.stdin.close(); ff.wait()
