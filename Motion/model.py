@@ -87,7 +87,7 @@ def fuse(det_onnx, path, form, cap, thr, boost):
              n("Gather", ["pre_hwf", swap], ["mo_wh"]), n("Div", ["mo_xy", "mo_wh"], ["mo_n"]),
              n("Mul", ["mo_n", c("mo_two", 2.0)], ["mo_n2"]), n("Sub", ["mo_n2", c("mo_one", 1.0)], ["mo_g"]), n("Unsqueeze", ["mo_g", ax], ["mo_grid"]),
              n("GridSample", [maskf, "mo_grid"], ["mo_s"], mode="nearest", padding_mode="zeros", align_corners=0),
-             n("Reshape", ["mo_s", c("mo_shape", [1, -1, 1], np.int64)], ["mo_fg"]),
+             n("Reshape", ["mo_s", c("mo_shape", [0, -1, 1], np.int64)], ["mo_fg"]),
              # sigmoid(logit(s) + boost) = s k / (1 + s (k - 1)) with k = e^boost
              n("Mul", ["mo_fg", c("mo_k", math.exp(boost) - 1)], ["mo_k1"]), n("Add", ["mo_k1", "mo_one"], ["mo_kk"]),
              n("Mul", ["mo_conf", "mo_kk"], ["mo_num"]), n("Mul", ["mo_conf", "mo_k1"], ["mo_d"]), n("Add", ["mo_d", "mo_one"], ["mo_den"]),
@@ -96,7 +96,7 @@ def fuse(det_onnx, path, form, cap, thr, boost):
     g.initializer.extend(bg.graph.initializer)
     g.input.append(bg.graph.input[1])
     del g.output[:]
-    g.output.extend([h.make_tensor_value_info("detections", T.FLOAT, [1, 300, 6])] + list(bg.graph.output))
+    g.output.extend([h.make_tensor_value_info("detections", T.FLOAT, [g.input[0].type.tensor_type.shape.dim[0].dim_param or 1, 300, 6])] + list(bg.graph.output))
     onnx.save(det, path)
 
 
@@ -122,7 +122,7 @@ class Engine:
         self.mask = torch.zeros(rows, 1, PH, PW, dtype=torch.uint8, device="cuda")
         self.ctx.set_tensor_address("state_out", self.next.data_ptr())
         self.ctx.set_tensor_address("mask", self.mask.data_ptr())
-        self.det = torch.zeros(1, 300, 6, device="cuda") if "detections" in [e.get_tensor_name(i) for i in range(e.num_io_tensors)] else None  # fuse()
+        self.det = torch.zeros(rows, 300, 6, device="cuda") if "detections" in [e.get_tensor_name(i) for i in range(e.num_io_tensors)] else None  # fuse()
         if self.det is not None:
             self.ctx.set_tensor_address("detections", self.det.data_ptr())
 
