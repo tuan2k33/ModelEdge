@@ -38,20 +38,16 @@ def train_stats(head, X, y, scale):
     return dict(train_loss=loss / len(X), train_acc=acc / len(X))
 
 
-def train_head(X, y, Xv, yv, k, epochs, stages, bs=1024, eps=1e-8, seed=0, hidden=0, scale=255):
-    """Linear head on X/scale (scale=255 for the int8 embeddings, any float scale for float ones) on the GPU: Adam, no weight decay. `stages` = [(lr, patience), ...]: train at lr until val loss is
+def train_head(X, y, Xv, yv, k, epochs, stages, hidden, bs=1024, eps=1e-8, seed=0, scale=255):
+    """MLP head D -> hidden -> k on X/scale (scale=255 for the int8 embeddings, any float scale for float ones) on the GPU: Adam, no weight decay. `stages` = [(lr, patience), ...]: train at lr until val loss is
     stale for `patience` epochs, then go back to the best weights and continue with the next (lower lr, smaller patience); the last stage ends the
-    run (early stop). hidden=H > 0 puts Linear(D, H) + ReLU in front (D = embedding size); then the metrics also carry `hidden_max`, the 99.9th percentile of the ReLU
-    output measured at the best checkpoint (its int8 scale at export). Returns metrics + the module holding the best-val-loss weights."""
+    run (early stop). The metrics also carry `hidden_max`, the 99.9th percentile of the ReLU output measured at the best checkpoint
+    (its int8 scale at export). Returns metrics + the module holding the best-val-loss weights."""
     X, Xv = torch.as_tensor(X, device="cuda"), torch.as_tensor(Xv, device="cuda").float() / scale  # X stays int8, converted per batch
     y, yv = torch.as_tensor(y, device="cuda").long(), torch.as_tensor(yv, device="cuda").long()
     torch.manual_seed(seed)
-    if hidden:
-        head = torch.nn.Sequential(torch.nn.Linear(X.shape[1], hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, k)).cuda()
-    else:
-        head = torch.nn.Linear(X.shape[1], k).cuda()
-        torch.nn.init.zeros_(head.weight); torch.nn.init.zeros_(head.bias)
-    torch.nn.init.constant_((head[2] if hidden else head).bias, -float(np.log(k - 1)))  # start at the prior of "none of the classes", or the k-1 negatives dominate the first steps
+    head = torch.nn.Sequential(torch.nn.Linear(X.shape[1], hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, k)).cuda()
+    torch.nn.init.constant_(head[2].bias, -float(np.log(k - 1)))  # start at the prior of "none of the classes", or the k-1 negatives dominate the first steps
     opt = torch.optim.Adam(head.parameters(), lr=stages[0][0], eps=eps)
     best, bad, ep, stage = np.inf, 0, 0, 0
     while epochs is None or ep < epochs:
@@ -69,9 +65,8 @@ def train_head(X, y, Xv, yv, k, epochs, stages, bs=1024, eps=1e-8, seed=0, hidde
         if loss < best - 1e-4:
             best, bad, info = loss, 0, dict(best_epoch=ep, val_loss=loss, val_acc=acc)
             state = {n: p.clone() for n, p in head.state_dict().items()}
-            if hidden:
-                with torch.no_grad():
-                    info["hidden_max"] = torch.quantile(head[1](head[0](X[:4096].float() / scale)).flatten(), 0.999).item()
+            with torch.no_grad():
+                info["hidden_max"] = torch.quantile(head[1](head[0](X[:4096].float() / scale)).flatten(), 0.999).item()
         elif (bad := bad + 1) >= stages[stage][1]:
             stage, bad = stage + 1, 0
             if stage == len(stages):
@@ -110,7 +105,6 @@ if __name__ == "__main__":
     ap.add_argument("--stages", default="1e-3:10,5e-4:8,2e-4:6,1e-4:4", help="lr:patience,... ; each stage ends after `patience` epochs without val-loss gain")
     ap.add_argument("--eps", type=float, default=1e-8, help="Adam eps")
     ap.add_argument("--bs", type=int, default=1024, help="head batch size")
-    ap.add_argument("--hidden", type=int, default=1024, help="hidden layer width of the MLP head; 0 = linear head")
     ap.add_argument("--seed", type=int, help="val split + batch order; default: random (printed and saved in metrics.json)")
     ap.add_argument("--per-class", type=int, help="default: all")
     ap.add_argument("--test-per-class", type=int)
@@ -139,6 +133,7 @@ if __name__ == "__main__":
         tm["embed_s"] = time.perf_counter() - t0
         tm["embed_ms_per_img"] = tm["embed_s"] / n * 1e3
         del eng
+    hidden = X.shape[1] // 2  # head D -> D/2 -> classes: ablation (CIFAR-10/100, 3 seeds, both backbones) against D -> classes and D -> D -> D/2 -> classes: best or tied on accuracy everywhere, same engine speed
     seed = a.seed if a.seed is not None else int(np.random.SeedSequence().entropy % 2**31)
     print(f"seed {seed}")
     perm = torch.randperm(len(X), device="cuda", generator=torch.Generator("cuda").manual_seed(seed))
@@ -147,18 +142,13 @@ if __name__ == "__main__":
     v, t = perm[:nv], perm[nv:]
     t0 = time.perf_counter()
     info, head_t = train_head(X[t], yg[t], X[v], yg[v], len(classes), a.epochs, [(float(l), int(p)) for l, p in (x.split(":") for x in a.stages.split(","))],
-                              bs=a.bs, eps=a.eps, seed=seed, hidden=a.hidden)
+                              hidden, bs=a.bs, eps=a.eps, seed=seed)
     tm["head_train_s"], tm["head_ms_per_epoch"] = time.perf_counter() - t0, (time.perf_counter() - t0) / info["epochs_run"] * 1e3
-    if a.hidden:
-        l1, l2 = head_t[0], head_t[2]
-        head = quantize(l1.weight.detach().T, l1.bias.detach(), l2.weight.detach().T, l2.bias.detach(), info["hidden_max"])
-    else:
-        head = quantize(head_t.weight.detach().T, head_t.bias.detach())
+    l1, l2 = head_t[0], head_t[2]
+    head = quantize(l1.weight.detach().T, l1.bias.detach(), l2.weight.detach().T, l2.bias.detach(), info["hidden_max"])
     with torch.no_grad():  # integer logits in float64 on the GPU: exact (|sum| < 2^53)
         g = lambda k: torch.as_tensor(head[k], device="cuda").double()
-        z = Xt.double()
-        if a.hidden:
-            z = torch.round(torch.relu(z @ g("W1") + g("b1")) / head["m1"]).clamp(0, 127)
+        z = torch.round(torch.relu(Xt.double() @ g("W1") + g("b1")) / head["m1"]).clamp(0, 127)
         z = z @ g("W") + g("b")
         acc = (z.argmax(1) == ytg).double().mean().item()
 
@@ -176,7 +166,7 @@ if __name__ == "__main__":
     lg = infer(fe, te[:BATCH])[1]
     assert np.allclose(lg, (z[:BATCH] * head["S"]).cpu().numpy(), atol=1e-3 * np.abs(lg).max()), "engine logits != int8 head logits"
     m = dict(data=a.data, backbone=a.backbone) | info | dict(test_acc=acc_e, train=len(t), val=nv, test=len(Xt),
-                    classes=len(classes), hidden=a.hidden, stages=a.stages, eps=a.eps, bs=a.bs, seed=seed, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
+                    classes=len(classes), hidden=hidden, stages=a.stages, eps=a.eps, bs=a.bs, seed=seed, gpu_mb=gpu, timing={k: round(v, 3) for k, v in tm.items()},
                     host_peak_ram_mb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)
     (run / "metrics.json").write_text(json.dumps(m, indent=1))
     print(run, json.dumps(m, indent=1))

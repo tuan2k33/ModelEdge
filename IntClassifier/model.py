@@ -194,16 +194,14 @@ def build_engine(name, sample):
     return src, eng
 
 
-def quantize(W, b, W2=None, b2=None, hmax=None):
-    """Linear head (W [D,k], b) -> int8 weights, int32 bias, S (logits are integers in units of 1/S). With W2/b2/hmax it is Linear(D,H) + ReLU + Linear(H,k):
+def quantize(W, b, W2, b2, hmax):
+    """MLP head Linear(D,H) + ReLU + Linear(H,k) -> int8 weights, int32 biases, S (logits are integers in units of 1/S);
     the ReLU output is requantized to int8 with scale 127/hmax (hmax = 99.9th percentile of that output, measured at the saved weights)."""
-    t = lambda A: None if A is None else torch.as_tensor(A, device="cuda", dtype=torch.float64)  # rounding on the GPU, results back as numpy for the ONNX graph
+    t = lambda A: torch.as_tensor(A, device="cuda", dtype=torch.float64)  # rounding on the GPU, results back as numpy for the ONNX graph
     W, b, W2, b2 = t(W) / 255, t(b), t(W2), t(b2)  # fold /255 so the head takes the raw int8 embedding
     s = float(127 / W.abs().max())
     q = lambda A, sc: torch.round(A * sc).to(torch.int8).cpu().numpy()
     qi = lambda A, sc: torch.round(A * sc).to(torch.int32).cpu().numpy()
-    if W2 is None:
-        return dict(W=q(W, s), b=qi(b, s), S=1 / s)
     sh, s2 = 127 / hmax, float(127 / W2.abs().max())  # logits end up in units of 1/(sh*s2)
     return dict(W1=q(W, s), b1=qi(b, s), m1=s / sh, W=q(W2, s2), b=qi(b2, sh * s2), S=1 / (sh * s2))
 
@@ -217,16 +215,15 @@ def build_model(head, classes, src):
     f = lambda n, v: nh.from_array(np.array(v, np.float32), n)
     g.initializer.extend([f("one", 1.0), nh.from_array(np.array(0, np.int8), "zero"), nh.from_array(head["W"], "Wq"), f("b", head["b"]), f("lo", 0)])
     n = h.make_node
-    nodes, x = [n("DequantizeLinear", ["feat_q", "one", "zero"], ["head_in"])], "head_in"
-    if "W1" in head:  # hidden layer: int8 GEMM, +bias, ReLU, requantize to int8 for the second GEMM
-        g.initializer.extend([nh.from_array(head["W1"], "W1q"), f("b1", head["b1"]), f("inv_m1", 1 / head["m1"]), f("c127", 127)])
-        nodes += [n("DequantizeLinear", ["W1q", "one", "zero"], ["W1f"]), n("MatMul", ["head_in", "W1f"], ["a1"]), n("Add", ["a1", "b1"], ["u0"]),
-                  # requantize with float ops, then an exact Q/DQ (scale 1) for the int8 GEMM: a QuantizeLinear with scale ~400 right after the
-                  # first GEMM got fused wrongly by TensorRT 11 (only ~90% of labels matched a numpy emulation, 100% with this form)
-                  n("Relu", ["u0"], ["u"]), n("Mul", ["u", "inv_m1"], ["uq"]), n("Round", ["uq"], ["ur"]), n("Clip", ["ur", "lo", "c127"], ["hr"]),
-                  n("QuantizeLinear", ["hr", "one", "zero"], ["hq"]), n("DequantizeLinear", ["hq", "one", "zero"], ["hf"])]
-        x = "hf"
-    nodes += [n("DequantizeLinear", ["Wq", "one", "zero"], ["Wf"]), n("MatMul", [x, "Wf"], ["acc"]), n("Add", ["acc", "b"], ["z"]),
+    # hidden layer: int8 GEMM, +bias, ReLU, requantize to int8 for the second GEMM
+    g.initializer.extend([nh.from_array(head["W1"], "W1q"), f("b1", head["b1"]), f("inv_m1", 1 / head["m1"]), f("c127", 127)])
+    nodes = [n("DequantizeLinear", ["feat_q", "one", "zero"], ["head_in"]), n("DequantizeLinear", ["W1q", "one", "zero"], ["W1f"]),
+             n("MatMul", ["head_in", "W1f"], ["a1"]), n("Add", ["a1", "b1"], ["u0"]),
+             # requantize with float ops, then an exact Q/DQ (scale 1) for the int8 GEMM: a QuantizeLinear with scale ~400 right after the
+             # first GEMM got fused wrongly by TensorRT 11 (only ~90% of labels matched a numpy emulation, 100% with this form)
+             n("Relu", ["u0"], ["u"]), n("Mul", ["u", "inv_m1"], ["uq"]), n("Round", ["uq"], ["ur"]), n("Clip", ["ur", "lo", "c127"], ["hr"]),
+             n("QuantizeLinear", ["hr", "one", "zero"], ["hq"]), n("DequantizeLinear", ["hq", "one", "zero"], ["hf"]),
+             n("DequantizeLinear", ["Wq", "one", "zero"], ["Wf"]), n("MatMul", ["hf", "Wf"], ["acc"]), n("Add", ["acc", "b"], ["z"]),
               n("ArgMax", ["z"], ["l64"], axis=1, keepdims=0), n("Cast", ["l64"], ["label"], to=T.INT32)]
     g.initializer.append(f("S", head["S"]))  # the head's logits are integers in units of 1/S
     nodes.append(n("Mul", ["z", "S"], ["logits"]))
