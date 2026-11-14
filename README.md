@@ -16,16 +16,17 @@ Only the head is trained, on cached embeddings, so training a new dataset takes 
 
 ## Results
 
-Frozen backbone + MLP head (2048-1024-classes, ReLU, int8 hidden activation), default settings, no hyperparameter tuning, one sigmoid (BCE) output per class, one run per dataset (seed 1). Test accuracy is measured through the final engine.
+Frozen backbone + MLP head (2048-1024-classes, ReLU, int8 hidden activation), default settings, no hyperparameter tuning, one sigmoid (BCE) output per class. Test accuracy is measured through the final engine.
 
-| Dataset | Classes | Train / val / test | Train acc | Val acc | Test acc |
-|---|---|---|---|---|---|
-| CIFAR-10 | 10 | 45k / 5k / 10k | 95.4% | 88.9% | **89.8%** |
-| CIFAR-100 | 100 | 45k / 5k / 10k | 85.3% | 70.6% | **70.0%** |
-| MNIST | 10 | 54k / 6k / 10k | 99.8% | 98.3% | **98.5%** |
-| Tiny ImageNet | 200 | 90k / 10k / 10k | 83.5% | 72.9% | **72.5%** |
-| Intel Image Classification (Kaggle) | 6 | 12.6k / 1.4k / 3k | 95.4% | 93.4% | **92.2%** |
-| EuroSAT RGB | 10 | 19.4k / 2.2k / 5.4k | 98.6% | 95.6% | **95.2%** |
+| Dataset | Classes | Train / val / test split (k) | Train / val / test acc (%) | Head train time (s) |
+|---|---|---|---|---|
+| CIFAR-10 | 10 | 45 / 5 / 10 | 95.64 / 90.20 / **90.02** | 13 |
+| CIFAR-100 | 100 | 45 / 5 / 10 | 85.32 / 70.60 / **70.00** | 14 |
+| MNIST | 10 | 54 / 6 / 10 | 99.84 / 98.27 / **98.50** | 20 |
+| EMNIST Balanced | 47 | 101.5 / 11.3 / 18.8 | 92.37 / 86.44 / **86.75** | 37 |
+| Tiny ImageNet | 200 | 90 / 10 / 10 | 83.51 / 72.88 / **72.48** | 21 |
+| Intel Image Classification | 6 | 12.6 / 1.4 / 3 | 95.43 / 93.44 / **92.17** | 6 |
+| EuroSAT RGB | 10 | 19.4 / 2.2 / 5.4 | 98.55 / 95.65 / **95.15** | 8 |
 
 Speed on an RTX 3050 Ti Laptop (4 GB), TensorRT 11.4, CUDA 13:
 
@@ -33,7 +34,7 @@ Speed on an RTX 3050 Ti Laptop (4 GB), TensorRT 11.4, CUDA 13:
 |---|---|
 | Engine latency, batch 1 / batch 64 | about 2-3 ms / 17.5 ms (about 3,600 img/s at batch 64) |
 | Embeddings for 60k CIFAR images | about 20 s (once, then cached) |
-| Head training | 6-21 s (14 s CIFAR-10, 21 s Tiny ImageNet) |
+| Head training | 6-38 s (table above) |
 | Engine build | about 100 s per run |
 | GPU memory for the engine | about 350 MB |
 
@@ -45,7 +46,7 @@ The INT8 ResNet50 (`resnet50-v1-12-int8.onnx`) and the datasets are downloaded o
 ```bash
 cd IntClassifier
 python train.py cifar10
-python train.py tiny-imagenet          # also: cifar100, mnist (downloaded on first use)
+python train.py tiny-imagenet          # also: cifar100, mnist, emnist (downloaded on first use)
 python train.py intel                   # your own folder: data/intel/{train,test}/<class>/*.jpg (or any path)
 python predict.py weight/cifar10/model.engine image.jpg
 ```

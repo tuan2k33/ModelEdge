@@ -53,6 +53,19 @@ def mnist(per, test_per):  # 28x28 grey digits, shown to the network as RGB
     return tr, y, te, yt, [str(c) for c in range(10)]
 
 
+def emnist(per, test_per):  # balanced split: 47 classes (digits + letters, look-alike lower/upper merged), 28x28 grey stored transposed
+    z = zipfile.ZipFile(fetch("https://biometrics.nist.gov/cs_links/EMNIST/gzip.zip", DATA / "emnist-gzip.zip"))
+    raw = lambda f, off: np.frombuffer(gzip.decompress(z.read(f"gzip/emnist-balanced-{f}")), np.uint8, offset=off)
+    classes = [chr(int(l.split()[1])) for l in z.read("gzip/emnist-balanced-mapping.txt").decode().split("\n") if l.strip()]
+    def read(split, n):
+        X, y = raw(f"{split}-images-idx3-ubyte.gz", 16).reshape(-1, 28, 28).transpose(0, 2, 1), raw(f"{split}-labels-idx1-ubyte.gz", 8)
+        i = np.concatenate([np.where(y == c)[0][:n] for c in range(len(classes))])
+        return [Image.fromarray(a).convert("RGB") for a in X[i]], y[i]
+    tr, y = read("train", per)
+    te, yt = read("test", test_per)
+    return tr, y, te, yt, classes
+
+
 def tiny_imagenet(per, test_per):  # reads the zip directly: 110k tiny files would be slow to extract on /mnt/c
     z = zipfile.ZipFile(fetch("http://cs231n.stanford.edu/tiny-imagenet-200.zip", DATA / "tiny-imagenet-200.zip"))
     r = "tiny-imagenet-200/"
@@ -84,7 +97,7 @@ def folder(root, per, test_per=None):  # <root>/train/<class>/*.jpg and <root>/t
     return tr, y, te, yt, classes
 
 
-DATASETS = {"cifar10": cifar10, "cifar100": cifar100, "mnist": mnist, "tiny-imagenet": tiny_imagenet}
+DATASETS = {"cifar10": cifar10, "cifar100": cifar100, "mnist": mnist, "emnist": emnist, "tiny-imagenet": tiny_imagenet}
 
 
 def load(name, per=None, test_per=None):

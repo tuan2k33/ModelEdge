@@ -17,7 +17,7 @@ ModelEdge turns pre-quantized / pretrained models into **single TensorRT engines
 No build, lint or test suite. Each sub-project is a set of scripts run **from inside its own directory** (they import siblings like `model`, `dataset` and use relative `data/`, `cache/`, `weight/`). Use the project venv (`.venv` → `~/.dev/venvs/ModelEdge`, py3.14). Needs an NVIDIA GPU, TensorRT 11 with `trtexec` on `PATH`, and `curl` (datasets and Model Zoo weights download on first use).
 
 ```bash
-cd IntClassifier && python train.py cifar10        # also cifar100, mnist, tiny-imagenet, or a folder with train/<class>/ and test/<class>/
+cd IntClassifier && python train.py cifar10        # also cifar100, mnist, emnist, tiny-imagenet, or a folder with train/<class>/ and test/<class>/
 cd IntClassifier && python predict.py weight/cifar10/model.engine image.jpg
 cd Detector      && python train.py --epochs 0 --name coco     # export only; or pass a data.yaml to fine-tune
 cd Detector      && python predict.py weight/coco/model.engine image.jpg --out result.jpg
