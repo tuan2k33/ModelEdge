@@ -20,27 +20,27 @@ Frozen backbone + MLP head (D-D/2-classes, ReLU, int8 hidden activation), defaul
 
 **ResNet50 INT8** (default, D = 2048):
 
-| Dataset | Classes | Train / val / test split (k) | Train / val / test acc (%) | Head train time (s) |
+| Dataset | Classes | Train/val/test (k) | Top-1 Accuracy (%) | Head train time (s) |
 |---|---|---|---|---|
-| CIFAR-10 | 10 | 45 / 5 / 10 | 95.64 / 90.20 / **90.02** | 13 |
-| CIFAR-100 | 100 | 45 / 5 / 10 | 85.32 / 70.60 / **70.00** | 14 |
-| MNIST | 10 | 54 / 6 / 10 | 99.84 / 98.27 / **98.50** | 20 |
-| EMNIST Balanced | 47 | 101.5 / 11.3 / 18.8 | 92.37 / 86.44 / **86.75** | 37 |
-| Tiny ImageNet | 200 | 90 / 10 / 10 | 83.51 / 72.88 / **72.48** | 21 |
-| Intel Image Classification | 6 | 12.6 / 1.4 / 3 | 95.43 / 93.44 / **92.17** | 6 |
-| EuroSAT RGB | 10 | 19.4 / 2.2 / 5.4 | 98.55 / 95.65 / **95.15** | 8 |
+| CIFAR-10 | 10 | 45 / 5 / 10 | 96 / 90 / **90** | 13 |
+| CIFAR-100 | 100 | 45 / 5 / 10 | 85 / 71 / **70** | 14 |
+| MNIST | 10 | 54 / 6 / 10 | 100 / 98 / **98** | 22 |
+| EMNIST Balanced | 47 | 102 / 11 / 19 | 92 / 86 / **87** | 37 |
+| Tiny ImageNet | 200 | 90 / 10 / 10 | 84 / 73 / **72** | 21 |
+| Intel Image Classification | 6 | 13 / 1 / 3 | 95 / 93 / **92** | 6 |
+| EuroSAT RGB | 10 | 19 / 2 / 5 | 99 / 96 / **95** | 8 |
 
 **DINOv3 ConvNeXt-Tiny INT8** (`--backbone convnext`, D = 768):
 
-| Dataset | Classes | Train / val / test split (k) | Train / val / test acc (%) | Head train time (s) |
+| Dataset | Classes | Train/val/test (k) | Top-1 Accuracy (%) | Head train time (s) |
 |---|---|---|---|---|
-| CIFAR-10 | 10 | 45 / 5 / 10 | 96.98 / 95.12 / **94.72** | 9 |
-| CIFAR-100 | 100 | 45 / 5 / 10 | 90.28 / 81.82 / **82.24** | 9 |
-| MNIST | 10 | 54 / 6 / 10 | 99.70 / 98.55 / **98.52** | 18 |
-| EMNIST Balanced | 47 | 101.5 / 11.3 / 18.8 | 91.01 / 86.69 / **86.50** | 34 |
-| Tiny ImageNet | 200 | 90 / 10 / 10 | 88.18 / 80.35 / **79.76** | 14 |
-| Intel Image Classification | 6 | 12.6 / 1.4 / 3 | 97.48 / 95.87 / **94.83** | 6 |
-| EuroSAT RGB | 10 | 19.4 / 2.2 / 5.4 | 99.02 / 95.23 / **95.59** | 8 |
+| CIFAR-10 | 10 | 45 / 5 / 10 | 97 / 95 / **95** | 9 |
+| CIFAR-100 | 100 | 45 / 5 / 10 | 90 / 82 / **82** | 9 |
+| MNIST | 10 | 54 / 6 / 10 | 100 / 99 / **99** | 18 |
+| EMNIST Balanced | 47 | 102 / 11 / 19 | 91 / 87 / **86** | 34 |
+| Tiny ImageNet | 200 | 90 / 10 / 10 | 87 / 80 / **80** | 14 |
+| Intel Image Classification | 6 | 13 / 1 / 3 | 98 / 97 / **95** | 6 |
+| EuroSAT RGB | 10 | 19 / 2 / 5 | 99 / 95 / **96** | 8 |
 
 Speed on an RTX 3050 Ti Laptop (4 GB), TensorRT 11.4, CUDA 13:
 
