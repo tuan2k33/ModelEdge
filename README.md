@@ -41,22 +41,23 @@ Speed on an RTX 3050 Ti Laptop (4 GB), TensorRT 11.4, CUDA 13:
 ## Usage
 
 Needs an NVIDIA GPU, PyTorch with CUDA, TensorRT 11 (Python package plus the `trtexec` binary on `PATH`), `cuda-python`, `onnx`, `onnxruntime`, `numpy` and `pillow`.
-The INT8 ResNet50 (`resnet50-v1-12-int8.onnx`) and the datasets are downloaded on first use with `curl`, so it must be installed. Datasets live in `IntClassifier/data/`. Run from `IntClassifier/`:
+The backbone is a ready INT8 Q/DQ ONNX downloaded from the Hugging Face Hub on first use (`huggingface_hub`; `HF_TOKEN` from the environment or the project `.env`): `--backbone resnet50` (default, [tuannw/resnet50-qdq-int8](https://huggingface.co/tuannw/resnet50-qdq-int8), from the ONNX Model Zoo `resnet50-v1-12-int8`) or `--backbone convnext` ([tuannw/dinov3-convnext-tiny-qdq-int8](https://huggingface.co/tuannw/dinov3-convnext-tiny-qdq-int8), DINOv3 ConvNeXt-Tiny, 94.8% on CIFAR-10). `export.py` rebuilds both from the upstream models and pushes them. The datasets are downloaded on first use with `curl`, so it must be installed. Datasets live in `IntClassifier/data/`. Run from `IntClassifier/`:
 
 ```bash
 cd IntClassifier
 python train.py cifar10
+python train.py cifar10 --backbone convnext   # writes weight/cifar10-convnext/
 python train.py tiny-imagenet          # also: cifar100, mnist, emnist (downloaded on first use)
 python train.py intel                   # your own folder: data/intel/{train,test}/<class>/*.jpg (or any path)
 python predict.py weight/cifar10/model.engine image.jpg
 ```
 
-Options: `--epochs N` (default: train until early stop), `--stages` (default `1e-3:10,5e-4:8,2e-4:6,1e-4:4`: lr:patience pairs, lower lr and smaller patience each time the val loss stalls), `--eps` (Adam eps, default 1e-8), `--bs` (head batch size, default 1024), `--hidden H` (MLP head 2048-H-classes with ReLU, default 1024, exported with an int8 hidden activation; 0 = one linear layer), `--seed` (default: random, saved in `metrics.json`), `--per-class N`, `--test-per-class N`.
+Options: `--epochs N` (default: train until early stop), `--stages` (default `1e-3:10,5e-4:8,2e-4:6,1e-4:4`: lr:patience pairs, lower lr and smaller patience each time the val loss stalls), `--eps` (Adam eps, default 1e-8), `--bs` (head batch size, default 1024), `--backbone resnet50|convnext`, `--hidden H` (MLP head D-H-classes, D = 2048 or 768 with ReLU, default 1024, exported with an int8 hidden activation; 0 = one linear layer), `--seed` (default: random, saved in `metrics.json`), `--per-class N`, `--test-per-class N`.
 
-Each run writes `weight/<dataset>/` (replacing the previous run of that dataset): `model.onnx`, `model.engine`, `metrics.json` (dataset, train/val/test accuracy and loss, timings, GPU and RAM use) and `train.log`.
+Each run writes `weight/<dataset>/` (`weight/<dataset>-convnext/` for ConvNeXt; replacing the previous run): `model.onnx`, `model.engine`, `metrics.json` (dataset, train/val/test accuracy and loss, timings, GPU and RAM use) and `train.log`.
 `predict.py` reads the class names from the `.onnx` next to the `.engine` and turns the top logit into a confidence with a sigmoid.
 
-Code in `IntClassifier/`: `train.py` (head training and the run), `model.py` (QLinear to QDQ conversion, engine runner, head graph), `dataset.py` (loaders), `predict.py`.
+Code in `IntClassifier/`: `train.py` (head training and the run), `model.py` (backbone download, QLinear to QDQ conversion, engine runner, head graph), `export.py` (builds and pushes the backbone ONNX), `dataset.py` (loaders), `predict.py`.
 Your own data: put it in `<root>/train/<class>/` and `<root>/test/<class>/` (same class folders in both) and pass `<root>` (a bare name is looked up in `data/`). To add a downloadable dataset, write a loader in `dataset.py` and register it in `DATASETS`. The Intel and EuroSAT numbers above come from the Kaggle downloads arranged this way (Intel: `seg_train` and `seg_test` renamed to `train` and `test`; EuroSAT: every 5th image of each class moved to `test`).
 
 ## How it works

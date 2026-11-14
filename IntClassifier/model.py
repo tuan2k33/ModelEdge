@@ -1,5 +1,5 @@
-"""The model: ONNX Model Zoo ResNet50 INT8 (QLinear) converted to QDQ for TensorRT, an engine runner, and the int8 linear head graph."""
-import json, subprocess
+"""The model: backbone Q/DQ ONNX from the Hub (built by export.py; the ResNet50 QLinear -> QDQ conversion lives here), an engine runner, and the int8 head graph."""
+import json, os, subprocess
 from pathlib import Path
 
 import numpy as np
@@ -166,24 +166,36 @@ def compile_engine(onnx_path, engine_path):
     assert r.returncode == 0, "\n".join(l for l in r.stdout.splitlines() if "[E]" in l)
 
 
-def build_engine(sample):
-    """Cached: zoo INT8 -> QDQ -> TensorRT INT8 engine (cache/backbone.engine). `sample`: a few PIL images to check the engine against the ONNX."""
-    eng = CACHE / "backbone.engine"
+BACKBONES = {"resnet50": "tuannw/resnet50-qdq-int8", "convnext": "tuannw/dinov3-convnext-tiny-qdq-int8"}  # built by export.py
+
+
+def backbone_onnx(name):
+    """The backbone Q/DQ ONNX from the Hub (private repos: HF_TOKEN from the environment or the project .env), cached by huggingface_hub."""
+    from huggingface_hub import hf_hub_download
+    token = os.environ.get("HF_TOKEN")
+    if not token and Path("../.env").exists():
+        token = next((l.split("=", 1)[1].strip().strip("'\"") for l in Path("../.env").read_text().splitlines() if l.startswith("HF_TOKEN=")), None)
+    return Path(hf_hub_download(BACKBONES[name], BACKBONES[name].split("/")[1] + ".onnx", token=token))
+
+
+def build_engine(name, sample):
+    """Cached: backbone ONNX -> TensorRT engine (cache/<name>.engine). `sample`: a few PIL images to check the engine against the ONNX run by ORT
+    (cos > 0.9, not ~1: rounding at bin edges differs between ORT and TensorRT and compounds over the quantized layers)."""
+    src, eng = backbone_onnx(name), CACHE / f"{name}.engine"
     if eng.exists():
-        return eng
+        return src, eng
     CACHE.mkdir(exist_ok=True)
-    onnx.save(qdq_backbone(), CACHE / "backbone-qdq.onnx")
-    compile_engine(CACHE / "backbone-qdq.onnx", eng)
+    compile_engine(src, eng)
     u8 = np.stack([arr(i) for i in sample])
-    ref = ort.InferenceSession(str(CACHE / "backbone-qdq.onnx")).run(None, {"image": u8})[0].astype(np.float32)
+    ref = ort.InferenceSession(str(src)).run(None, {"image": u8})[0].astype(np.float32)
     got = Engine(eng)(u8)[0].astype(np.float32)
     cos = (ref * got).sum(1) / np.linalg.norm(ref, axis=1) / np.linalg.norm(got, axis=1)
-    assert cos.min() > 0.98, f"engine differs from its ONNX source: cos {cos.min():.3f}"
-    return eng
+    assert cos.min() > 0.9, f"engine differs from its ONNX source: cos {cos.min():.3f}"
+    return src, eng
 
 
 def quantize(W, b, W2=None, b2=None, hmax=None):
-    """Linear head (W [2048,k], b) -> int8 weights, int32 bias, S (logits are integers in units of 1/S). With W2/b2/hmax it is Linear(2048,H) + ReLU + Linear(H,k):
+    """Linear head (W [D,k], b) -> int8 weights, int32 bias, S (logits are integers in units of 1/S). With W2/b2/hmax it is Linear(D,H) + ReLU + Linear(H,k):
     the ReLU output is requantized to int8 with scale 127/hmax (hmax = 99.9th percentile of that output, measured at the saved weights)."""
     t = lambda A: None if A is None else torch.as_tensor(A, device="cuda", dtype=torch.float64)  # rounding on the GPU, results back as numpy for the ONNX graph
     W, b, W2, b2 = t(W) / 255, t(b), t(W2), t(b2)  # fold /255 so the head takes the raw int8 embedding
@@ -196,19 +208,19 @@ def quantize(W, b, W2=None, b2=None, hmax=None):
     return dict(W1=q(W, s), b1=qi(b, s), m1=s / sh, W=q(W2, s2), b=qi(b2, sh * s2), S=1 / (sh * s2))
 
 
-def build_model(head, classes):
+def build_model(head, classes, src):
     """Backbone QDQ + head in one graph, TensorRT-parseable: uint8 image -> label, logits (float [N,classes], one per class; sigmoid(logit) is that class's confidence, left to the caller). The backbone's int8
     pool tensor feeds the int8 x int8 GEMM(s) directly (DQ with scale 1, so a GEMM output is the int32 accumulator). Bias and ReLU are float ops on integer
     values: TensorRT has no BitShift/MatMulInteger."""
-    m = onnx.load(CACHE / "backbone-qdq.onnx")
+    m = onnx.load(src)
     g = m.graph
     f = lambda n, v: nh.from_array(np.array(v, np.float32), n)
     g.initializer.extend([f("one", 1.0), nh.from_array(np.array(0, np.int8), "zero"), nh.from_array(head["W"], "Wq"), f("b", head["b"]), f("lo", 0)])
     n = h.make_node
-    nodes, x = [n("DequantizeLinear", ["feat_q", "one", "zero"], ["feat"])], "feat"
+    nodes, x = [n("DequantizeLinear", ["feat_q", "one", "zero"], ["head_in"])], "head_in"
     if "W1" in head:  # hidden layer: int8 GEMM, +bias, ReLU, requantize to int8 for the second GEMM
         g.initializer.extend([nh.from_array(head["W1"], "W1q"), f("b1", head["b1"]), f("inv_m1", 1 / head["m1"]), f("c127", 127)])
-        nodes += [n("DequantizeLinear", ["W1q", "one", "zero"], ["W1f"]), n("MatMul", ["feat", "W1f"], ["a1"]), n("Add", ["a1", "b1"], ["u0"]),
+        nodes += [n("DequantizeLinear", ["W1q", "one", "zero"], ["W1f"]), n("MatMul", ["head_in", "W1f"], ["a1"]), n("Add", ["a1", "b1"], ["u0"]),
                   # requantize with float ops, then an exact Q/DQ (scale 1) for the int8 GEMM: a QuantizeLinear with scale ~400 right after the
                   # first GEMM got fused wrongly by TensorRT 11 (only ~90% of labels matched a numpy emulation, 100% with this form)
                   n("Relu", ["u0"], ["u"]), n("Mul", ["u", "inv_m1"], ["uq"]), n("Round", ["uq"], ["ur"]), n("Clip", ["ur", "lo", "c127"], ["hr"]),
@@ -219,6 +231,8 @@ def build_model(head, classes):
     g.initializer.append(f("S", head["S"]))  # the head's logits are integers in units of 1/S
     nodes.append(n("Mul", ["z", "S"], ["logits"]))
     out = [h.make_tensor_value_info("label", T.INT32, [None]), h.make_tensor_value_info("logits", T.FLOAT, [None, len(classes)])]
+    names = [o for x in g.node for o in x.output] + [i.name for i in g.initializer]
+    assert not {o for x in nodes for o in x.output} & set(names), "head names collide with the backbone graph"
     g.node.extend(nodes)
     del g.output[:]
     g.output.extend(out)
