@@ -166,7 +166,8 @@ def compile_engine(onnx_path, engine_path):
     assert r.returncode == 0, "\n".join(l for l in r.stdout.splitlines() if "[E]" in l)
 
 
-BACKBONES = {"resnet50": "tuannw/resnet50-qdq-int8", "convnext": "tuannw/dinov3-convnext-tiny-qdq-int8"}  # built by export.py
+HUB = "tuannw/ModelEdge"  # private HF repo, one folder per model
+BACKBONES = {"resnet50": "resnet50-qdq-int8", "convnext": "dinov3-convnext-tiny-qdq-int8"}  # folder = file stem, built by export.py
 
 
 def backbone_onnx(name):
@@ -175,7 +176,7 @@ def backbone_onnx(name):
     token = os.environ.get("HF_TOKEN")
     if not token and Path("../.env").exists():
         token = next((l.split("=", 1)[1].strip().strip("'\"") for l in Path("../.env").read_text().splitlines() if l.startswith("HF_TOKEN=")), None)
-    return Path(hf_hub_download(BACKBONES[name], BACKBONES[name].split("/")[1] + ".onnx", token=token))
+    return Path(hf_hub_download(HUB, f"{BACKBONES[name]}/{BACKBONES[name]}.onnx", token=token))
 
 
 def build_engine(name, sample):

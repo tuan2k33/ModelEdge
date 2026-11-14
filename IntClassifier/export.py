@@ -2,7 +2,7 @@
 built once from the upstream weights and pushed to the Hugging Face Hub, so training a head only needs the file:
     python export.py resnet50            # ONNX Model Zoo resnet50-v1-12-int8 (QLinear) -> weight/backbone/resnet50-qdq-int8.onnx, D=2048
     python export.py convnext            # facebook/dinov3-convnext-tiny-pretrain-lvd1689m -> weight/backbone/dinov3-convnext-tiny-qdq-int8.onnx, D=768
-    python export.py push [resnet50|convnext]   # private repos <hf user>/<file stem>, with the license and a model card
+    python export.py push [resnet50|convnext]   # into the private HF repo model.HUB, folder <file stem>/, with the license and a model card
 ConvNeXt: Q/DQ only where int8 math runs, the activation input and the weight of the stem/downsample convs and the pointwise Linears (40 of 58).
 Depthwise convs stay FP16 (the most sensitive layers, and int8 depthwise was slower on TensorRT: layout changes around it); LayerNorm, GELU and the
 residual stream stay FP16 with no Q/DQ around them (TensorRT fuses GELU into the first pointwise GEMM and the following Q into LayerNorm).
@@ -14,12 +14,11 @@ from pathlib import Path
 import numpy as np, onnx, torch, torch.nn.functional as F
 from onnx import helper as h, numpy_helper as nh
 
-from model import BATCH, MEAN, STD, qdq_backbone
+from model import BACKBONES as NAMES, BATCH, HUB, MEAN, STD, qdq_backbone
 
 OUT = Path("weight/backbone")
 CONVNEXT = "facebook/dinov3-convnext-tiny-pretrain-lvd1689m"
 PCT, NCAL = 99.99, 256
-NAMES = {"resnet50": "resnet50-qdq-int8", "convnext": "dinov3-convnext-tiny-qdq-int8"}
 
 
 def resnet50():
@@ -113,12 +112,7 @@ def save(which):
     print(path, f"{path.stat().st_size / 2**20:.1f} MB", meta)
 
 
-CARD = """---
-license: {license}
-library_name: onnx
-tags: [tensorrt, int8, qdq, image-feature-extraction]
----
-# {name}
+CARD = """# {name}
 
 INT8 Q/DQ ONNX backbone for [ModelEdge IntClassifier](https://github.com/tuan2k33/ModelEdge): a frozen feature extractor that TensorRT builds into one INT8 engine.
 
@@ -146,19 +140,20 @@ def push(which):
     meta = {p.key: p.value for p in onnx.load(path, load_external_data=False).metadata_props}
     dim = onnx.load(path).graph.output[0].type.tensor_type.shape.dim[1].dim_value
     api = HfApi(token=os.environ["HF_TOKEN"])
-    repo = f"{api.whoami()['name']}/{NAMES[which]}"
-    api.create_repo(repo, private=True, exist_ok=True)
+    api.create_repo(HUB, private=True, exist_ok=True)
     if which == "convnext":
         lic = Path(hf_hub_download(CONVNEXT, "LICENSE.md", token=os.environ["HF_TOKEN"]))
         files, license_, license_text = {"LICENSE.md": lic}, "other", "DINOv3 License, see [LICENSE.md](LICENSE.md): this model is a derivative of the DINO Materials and is distributed under that Agreement."
     else:
-        files, license_, license_text = {}, "apache-2.0", "Apache-2.0, as the source model in the ONNX Model Zoo."
+        from dataset import fetch
+        lic = fetch("https://www.apache.org/licenses/LICENSE-2.0.txt", OUT / "LICENSE-apache-2.0.txt")
+        files, license_, license_text = {"LICENSE": lic}, "apache-2.0", "Apache-2.0 (see [LICENSE](LICENSE)), as the source model in the ONNX Model Zoo."
     card = OUT / f"{NAMES[which]}.README.md"
     card.write_text(CARD.format(name=NAMES[which], dim=dim, feat_scale=float(meta["feat_scale"]), source=meta["source"], notes=NOTES[which],
                                 license=license_, license_text=license_text))
     for dst, src in {f"{NAMES[which]}.onnx": path, "README.md": card, **files}.items():
-        api.upload_file(path_or_fileobj=str(src), path_in_repo=dst, repo_id=repo)
-    print(f"https://huggingface.co/{repo}")
+        api.upload_file(path_or_fileobj=str(src), path_in_repo=f"{NAMES[which]}/{dst}", repo_id=HUB)
+    print(f"https://huggingface.co/{HUB}/tree/main/{NAMES[which]}")
 
 
 if __name__ == "__main__":
